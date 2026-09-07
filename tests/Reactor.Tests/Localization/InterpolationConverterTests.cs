@@ -141,6 +141,47 @@ public class InterpolationConverterTests
     }
 
     [Fact]
+    public void QuantitySuffixTernary_ConvertsToIcuPlural()
+    {
+        var node = ParseInterpolation("$\"{remaining} item{(remaining == 1 ? \"\" : \"s\")} left\"");
+        var (icu, argMap, warnings) = InterpolationConverter.Convert(node);
+
+        Assert.Equal("{remaining, plural, one {# item} other {# items}} left", icu);
+        Assert.Null(argMap);
+        Assert.Empty(warnings);
+    }
+
+    [Fact]
+    public void QuantitySuffixTernary_WithNotEquals_ConvertsToIcuPlural()
+    {
+        var node = ParseInterpolation("$\"{remaining} item{(remaining != 1 ? \"s\" : \"\")} left\"");
+        var (icu, _, warnings) = InterpolationConverter.Convert(node);
+
+        Assert.Equal("{remaining, plural, one {# item} other {# items}} left", icu);
+        Assert.Empty(warnings);
+    }
+
+    [Fact]
+    public void QuantityTernary_WithFullWords_ConvertsToIcuPlural()
+    {
+        var node = ParseInterpolation("$\"{remaining == 1 ? \"item\" : \"items\"}\"");
+        var (icu, _, warnings) = InterpolationConverter.Convert(node);
+
+        Assert.Equal("{remaining, plural, one {# item} other {# items}}", icu);
+        Assert.Empty(warnings);
+    }
+
+    [Fact]
+    public void QuantitySuffixTernary_WithoutAdjacentQuantity_StillUsesIcuPlural()
+    {
+        var node = ParseInterpolation("$\"item{remaining == 1 ? \"\" : \"s\"}\"");
+        var (icu, _, warnings) = InterpolationConverter.Convert(node);
+
+        Assert.Equal("item{remaining, plural, one {} other {s}}", icu);
+        Assert.Empty(warnings);
+    }
+
+    [Fact]
     public void Ternary_WithNonLiteralBranch_StillWarnsComplex()
     {
         var node = ParseInterpolation("$\"Value: {(flag ? GetValue() : \"default\")}\"");

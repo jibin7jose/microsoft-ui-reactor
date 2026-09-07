@@ -47,8 +47,9 @@ internal static class InterpolationConverter
         var warnings = new List<string>();
         var usedNames = new HashSet<string>();
 
-        foreach (var content in interpolated.Contents)
+        for (var contentIndex = 0; contentIndex < interpolated.Contents.Count; contentIndex++)
         {
+            var content = interpolated.Contents[contentIndex];
             switch (content)
             {
                 case InterpolatedStringTextSyntax text:
@@ -64,6 +65,18 @@ internal static class InterpolationConverter
                         expr = parens.Expression;
 
                     // Ternary with string-literal branches → ICU select
+                    if (TryConvertPluralSuffix(interpolated, contentIndex, expr, icuParts, usedNames, argumentMap, out var suffixPluralIcu))
+                    {
+                        icuParts.Add(suffixPluralIcu!);
+                        break;
+                    }
+
+                    if (TryConvertTernaryPlural(expr, usedNames, argumentMap, out var pluralIcu))
+                    {
+                        icuParts.Add(pluralIcu!);
+                        break;
+                    }
+
                     if (TryConvertTernarySelect(expr, usedNames, argumentMap, out var selectIcu))
                     {
                         icuParts.Add(selectIcu!);
@@ -178,6 +191,170 @@ internal static class InterpolationConverter
 
         icuSelect = $"{{{uniqueName}, select, true {{{trueText}}} false {{{falseText}}}}}";
         return true;
+    }
+
+    private static bool TryConvertPluralSuffix(
+        InterpolatedStringExpressionSyntax interpolated,
+        int contentIndex,
+        ExpressionSyntax expr,
+        List<string> icuParts,
+        HashSet<string> usedNames,
+        Dictionary<string, string> argumentMap,
+        out string? icuPlural)
+    {
+        icuPlural = null;
+        if (!TryGetPluralTernary(expr, out var quantity, out var singularText, out var pluralText))
+            return false;
+
+        if (string.IsNullOrEmpty(singularText) == string.IsNullOrEmpty(pluralText))
+            return false;
+
+        var previousTextIndex = contentIndex - 1;
+        var previousQuantityIndex = contentIndex - 2;
+        if (previousQuantityIndex < 0
+            || interpolated.Contents[previousTextIndex] is not InterpolatedStringTextSyntax previousText
+            || interpolated.Contents[previousQuantityIndex] is not InterpolationSyntax previousQuantityHole)
+            return false;
+
+        var previousExpression = previousQuantityHole.Expression;
+        while (previousExpression is ParenthesizedExpressionSyntax parens)
+            previousExpression = parens.Expression;
+
+        var previousQuantityText = AnalyzeExpression(previousExpression).exprText;
+        if (!string.Equals(previousQuantityText, quantity.exprText, StringComparison.Ordinal))
+            return false;
+
+        var literal = previousText.TextToken.ValueText;
+        var trimmedLiteral = literal.TrimEnd();
+        var wordStart = trimmedLiteral.Length;
+        while (wordStart > 0 && char.IsLetter(trimmedLiteral[wordStart - 1]))
+            wordStart--;
+
+        if (wordStart == trimmedLiteral.Length || icuParts.Count < 2)
+            return false;
+
+        icuParts.RemoveRange(icuParts.Count - 2, 2);
+        var uniqueName = usedNames.Contains(quantity.name)
+            ? quantity.name
+            : AddParameter(quantity, usedNames, argumentMap);
+        var singular = EscapeForIcu($"#{trimmedLiteral}");
+        var pluralSuffix = string.IsNullOrEmpty(pluralText) ? singularText : pluralText;
+        var plural = EscapeForIcu($"#{trimmedLiteral}{pluralSuffix}");
+        icuPlural = $"{{{uniqueName}, plural, one {{{singular}}} other {{{plural}}}}}";
+        return true;
+    }
+
+    private static bool TryConvertTernaryPlural(
+        ExpressionSyntax expr,
+        HashSet<string> usedNames,
+        Dictionary<string, string> argumentMap,
+        out string? icuPlural)
+    {
+        icuPlural = null;
+        if (!TryGetPluralTernary(expr, out var quantity, out var singularText, out var pluralText)
+            || (string.IsNullOrEmpty(singularText) && string.IsNullOrEmpty(pluralText)))
+            return false;
+
+        var uniqueName = AddParameter(quantity, usedNames, argumentMap);
+        if (string.IsNullOrEmpty(singularText) || string.IsNullOrEmpty(pluralText))
+        {
+            var singularSuffix = EscapeForIcu(singularText);
+            var pluralSuffix = EscapeForIcu(pluralText);
+            icuPlural = $"{{{uniqueName}, plural, one {{{singularSuffix}}} other {{{pluralSuffix}}}}}";
+            return true;
+        }
+
+        var singular = EscapeForIcu($"# {singularText}");
+        var plural = EscapeForIcu($"# {pluralText}");
+        icuPlural = $"{{{uniqueName}, plural, one {{{singular}}} other {{{plural}}}}}";
+        return true;
+    }
+
+    private static bool TryGetPluralTernary(
+        ExpressionSyntax expr,
+        out (string name, string exprText) quantity,
+        out string singularText,
+        out string pluralText)
+    {
+        quantity = default;
+        singularText = string.Empty;
+        pluralText = string.Empty;
+
+        if (expr is not ConditionalExpressionSyntax ternary
+            || !TryGetPluralCondition(ternary.Condition, out quantity, out var trueIsSingular))
+            return false;
+
+        if (ternary.WhenTrue is not LiteralExpressionSyntax trueLiteral
+            || !trueLiteral.IsKind(SyntaxKind.StringLiteralExpression)
+            || ternary.WhenFalse is not LiteralExpressionSyntax falseLiteral
+            || !falseLiteral.IsKind(SyntaxKind.StringLiteralExpression))
+            return false;
+
+        if (trueIsSingular)
+        {
+            singularText = trueLiteral.Token.ValueText;
+            pluralText = falseLiteral.Token.ValueText;
+        }
+        else
+        {
+            singularText = falseLiteral.Token.ValueText;
+            pluralText = trueLiteral.Token.ValueText;
+        }
+
+        return true;
+    }
+
+    private static bool TryGetPluralCondition(
+        ExpressionSyntax condition,
+        out (string name, string exprText) quantity,
+        out bool trueIsSingular)
+    {
+        quantity = default;
+        trueIsSingular = false;
+
+        if (condition is not BinaryExpressionSyntax binary
+            || (binary.Kind() != SyntaxKind.EqualsExpression && binary.Kind() != SyntaxKind.NotEqualsExpression))
+            return false;
+
+        ExpressionSyntax? quantityExpression = null;
+        if (IsOneLiteral(binary.Right))
+            quantityExpression = binary.Left;
+        else if (IsOneLiteral(binary.Left))
+            quantityExpression = binary.Right;
+
+        if (quantityExpression is null)
+            return false;
+
+        var (name, exprText, isComplex) = AnalyzeExpression(quantityExpression);
+        if (name is null || isComplex)
+            return false;
+
+        quantity = (name, exprText);
+        trueIsSingular = binary.Kind() == SyntaxKind.EqualsExpression;
+        return true;
+    }
+
+    private static bool IsOneLiteral(ExpressionSyntax expression) =>
+        expression is LiteralExpressionSyntax literal
+        && literal.IsKind(SyntaxKind.NumericLiteralExpression)
+        && literal.Token.Value is int value
+        && value == 1;
+
+    private static string AddParameter(
+        (string name, string exprText) parameter,
+        HashSet<string> usedNames,
+        Dictionary<string, string> argumentMap)
+    {
+        var baseName = parameter.name;
+        var uniqueName = baseName;
+        var suffix = 2;
+        while (!usedNames.Add(uniqueName))
+            uniqueName = $"{baseName}{suffix++}";
+
+        if (parameter.exprText != uniqueName)
+            argumentMap[uniqueName] = parameter.exprText;
+
+        return uniqueName;
     }
 
     private static (string? name, string exprText, bool isComplex) AnalyzeExpression(ExpressionSyntax expr)
