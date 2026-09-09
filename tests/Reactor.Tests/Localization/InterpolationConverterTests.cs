@@ -219,6 +219,16 @@ public class InterpolationConverterTests
     }
 
     [Fact]
+    public void QuantitySuffixTernary_WithLiteralSeparator_PreservesWordSpacing()
+    {
+        var node = ParseInterpolation("$\"{count} unread {(count == 1 ? \"message\" : \"messages\")}\"");
+        var (icu, _, warnings) = InterpolationConverter.Convert(node);
+
+        Assert.Equal("{count, plural, one {# unread message} other {# unread messages}}", icu);
+        Assert.Empty(warnings);
+    }
+
+    [Fact]
     public void QuantitySuffixTernary_EscapesLiteralNumberSigns()
     {
         var node = ParseInterpolation("$\"{count} #item{(count == 1 ? \"\" : \"s\")}\"");
@@ -257,7 +267,7 @@ public class InterpolationConverterTests
         var (icu, _, warnings) = InterpolationConverter.Convert(node);
 
         Assert.Equal("{count, plural, one {# item} other {# items}}", icu);
-        Assert.Contains("Format specifier on quantity 'count'", warnings);
+        Assert.Contains(warnings, warning => warning.Contains("Format specifier on quantity 'count'"));
     }
 
     [Fact]

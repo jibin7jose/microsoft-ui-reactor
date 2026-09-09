@@ -229,8 +229,8 @@ internal static class InterpolationConverter
             warnings.Add($"Format specifier on quantity '{previousQuantityText}' is represented by the ICU plural number sign");
 
         icuParts.RemoveRange(icuParts.Count - 2, 2);
-        var singular = $"#{EscapeForIcuPluralBody(trimmedLiteral)}{EscapeForIcuPluralBody(singularText)}";
-        var plural = $"#{EscapeForIcuPluralBody(trimmedLiteral)}{EscapeForIcuPluralBody(pluralText)}";
+        var singular = $"#{EscapeForIcuPluralBody(literal)}{EscapeForIcuPluralBody(singularText)}";
+        var plural = $"#{EscapeForIcuPluralBody(literal)}{EscapeForIcuPluralBody(pluralText)}";
         icuPlural = $"{{{uniqueName}, plural, one {{{singular}}} other {{{plural}}}}}";
         return true;
     }
