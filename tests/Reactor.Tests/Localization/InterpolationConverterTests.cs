@@ -125,6 +125,8 @@ public class InterpolationConverterTests
         var (icu, argMap, warnings) = InterpolationConverter.Convert(node);
 
         Assert.Equal("Dark mode: {darkMode, select, true {Yes} false {No}}", icu);
+        Assert.NotNull(argMap);
+        Assert.Equal("(darkMode) ? \"true\" : \"false\"", argMap!["darkMode"]);
         Assert.Empty(warnings);
     }
 
@@ -164,7 +166,7 @@ public class InterpolationConverterTests
     [Fact]
     public void QuantityTernary_WithFullWords_ConvertsToIcuPlural()
     {
-        var node = ParseInterpolation("$\"{remaining == 1 ? \"item\" : \"items\"}\"");
+        var node = ParseInterpolation("$\"{(remaining == 1 ? \"item\" : \"items\")}\"");
         var (icu, _, warnings) = InterpolationConverter.Convert(node);
 
         Assert.Equal("{remaining, plural, one {# item} other {# items}}", icu);
@@ -174,10 +176,55 @@ public class InterpolationConverterTests
     [Fact]
     public void QuantitySuffixTernary_WithoutAdjacentQuantity_StillUsesIcuPlural()
     {
-        var node = ParseInterpolation("$\"item{remaining == 1 ? \"\" : \"s\"}\"");
+        var node = ParseInterpolation("$\"item{(remaining == 1 ? \"\" : \"s\")}\"");
         var (icu, _, warnings) = InterpolationConverter.Convert(node);
 
         Assert.Equal("item{remaining, plural, one {} other {s}}", icu);
+        Assert.Empty(warnings);
+    }
+
+    [Fact]
+    public void NonQuantityEqualityTernary_RemainsSelect()
+    {
+        var node = ParseInterpolation("$\"Status: {(status == 1 ? \"Enabled\" : \"Disabled\")}\"");
+        var (icu, argMap, warnings) = InterpolationConverter.Convert(node);
+
+        Assert.Equal("Status: {arg0, select, true {Enabled} false {Disabled}}", icu);
+        Assert.NotNull(argMap);
+        Assert.Equal("(status == 1) ? \"true\" : \"false\"", argMap!["arg0"]);
+        Assert.Empty(warnings);
+    }
+
+    [Fact]
+    public void QuantitySuffixTernary_ReusesEmittedUniqueParameterName()
+    {
+        var node = ParseInterpolation("$\"{model.Count} pending, {count} item{(count == 1 ? \"\" : \"s\")}\"");
+        var (icu, argMap, warnings) = InterpolationConverter.Convert(node);
+
+        Assert.Equal("{count} pending, {count2, plural, one {# item} other {# items}}", icu);
+        Assert.NotNull(argMap);
+        Assert.Equal("model.Count", argMap!["count"]);
+        Assert.Equal("count", argMap["count2"]);
+        Assert.Empty(warnings);
+    }
+
+    [Fact]
+    public void QuantitySuffixTernary_WithTwoNonEmptyBranches_FoldsIntoOnePlural()
+    {
+        var node = ParseInterpolation("$\"{count} file{(count == 1 ? \" is\" : \"s are\")} selected\"");
+        var (icu, _, warnings) = InterpolationConverter.Convert(node);
+
+        Assert.Equal("{count, plural, one {# file is} other {# files are}} selected", icu);
+        Assert.Empty(warnings);
+    }
+
+    [Fact]
+    public void QuantitySuffixTernary_EscapesLiteralNumberSigns()
+    {
+        var node = ParseInterpolation("$\"{count} #item{(count == 1 ? \"\" : \"s\")}\"");
+        var (icu, _, warnings) = InterpolationConverter.Convert(node);
+
+        Assert.Equal("{count, plural, one {# '#'item} other {# '#'items}}", icu);
         Assert.Empty(warnings);
     }
 
@@ -197,6 +244,7 @@ public class InterpolationConverterTests
     [InlineData("total", true)]
     [InlineData("numItems", true)]
     [InlineData("totalCount", true)]
+    [InlineData("remaining", true)]
     [InlineData("name", false)]
     [InlineData("description", false)]
     public void IsQuantityName_CorrectResults(string name, bool expected)

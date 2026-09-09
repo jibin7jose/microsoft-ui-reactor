@@ -37,6 +37,7 @@ internal static class InterpolationConverter
     private static readonly HashSet<string> QuantityHintNames = new(StringComparer.OrdinalIgnoreCase)
     {
         "count", "total", "length", "size", "amount", "quantity",
+        "remaining",
     };
 
     public static (string? icuMessage, Dictionary<string, string>? argumentMap, List<string> warnings)
@@ -46,6 +47,7 @@ internal static class InterpolationConverter
         var argumentMap = new Dictionary<string, string>();
         var warnings = new List<string>();
         var usedNames = new HashSet<string>();
+        var emittedHoleNames = new Dictionary<int, string>();
 
         for (var contentIndex = 0; contentIndex < interpolated.Contents.Count; contentIndex++)
         {
@@ -65,13 +67,13 @@ internal static class InterpolationConverter
                         expr = parens.Expression;
 
                     // Ternary with string-literal branches → ICU select
-                    if (TryConvertPluralSuffix(interpolated, contentIndex, expr, icuParts, usedNames, argumentMap, out var suffixPluralIcu))
+                    if (TryConvertPluralSuffix(interpolated, contentIndex, expr, icuParts, emittedHoleNames, warnings, out var suffixPluralIcu, out var suppressStandalonePlural))
                     {
                         icuParts.Add(suffixPluralIcu!);
                         break;
                     }
 
-                    if (TryConvertTernaryPlural(expr, usedNames, argumentMap, out var pluralIcu))
+                    if (!suppressStandalonePlural && TryConvertTernaryPlural(expr, usedNames, argumentMap, out var pluralIcu))
                     {
                         icuParts.Add(pluralIcu!);
                         break;
@@ -93,19 +95,7 @@ internal static class InterpolationConverter
                     }
 
                     // Ensure unique param names
-                    var baseName = paramName ?? $"arg{usedNames.Count}";
-                    var uniqueName = baseName;
-                    var suffix = 2;
-                    while (!usedNames.Add(uniqueName))
-                    {
-                        uniqueName = $"{baseName}{suffix++}";
-                    }
-
-                    // Map back to original expression
-                    if (exprText != uniqueName)
-                    {
-                        argumentMap[uniqueName] = exprText;
-                    }
+                    var uniqueName = AddParameter(paramName, exprText, usedNames, argumentMap);
 
                     // Convert format specifier to ICU formatter
                     var formatClause = hole.FormatClause;
@@ -131,6 +121,7 @@ internal static class InterpolationConverter
                     {
                         icuParts.Add($"{{{uniqueName}}}");
                     }
+                    emittedHoleNames[contentIndex] = uniqueName;
                     break;
             }
         }
@@ -177,14 +168,10 @@ internal static class InterpolationConverter
 
         // Resolve a parameter name from the condition
         var (condName, condExpr, _) = AnalyzeExpression(ternary.Condition);
-        var baseName = condName ?? $"arg{usedNames.Count}";
-        var uniqueName = baseName;
-        var suffix = 2;
-        while (!usedNames.Add(uniqueName))
-            uniqueName = $"{baseName}{suffix++}";
-
-        if (condExpr != uniqueName)
-            argumentMap[uniqueName] = condExpr;
+        var uniqueName = AddParameter(condName, condExpr, usedNames, argumentMap);
+        // ICU select keys are strings. Normalize the C# boolean condition rather
+        // than passing a bool to the MessageFormat runtime.
+        argumentMap[uniqueName] = $"({condExpr}) ? \"true\" : \"false\"";
 
         var trueText = EscapeForIcu(whenTrueLit.Token.ValueText);
         var falseText = EscapeForIcu(whenFalseLit.Token.ValueText);
@@ -198,15 +185,14 @@ internal static class InterpolationConverter
         int contentIndex,
         ExpressionSyntax expr,
         List<string> icuParts,
-        HashSet<string> usedNames,
-        Dictionary<string, string> argumentMap,
-        out string? icuPlural)
+        IReadOnlyDictionary<int, string> emittedHoleNames,
+        List<string> warnings,
+        out string? icuPlural,
+        out bool suppressStandalonePlural)
     {
         icuPlural = null;
+        suppressStandalonePlural = false;
         if (!TryGetPluralTernary(expr, out var quantity, out var singularText, out var pluralText))
-            return false;
-
-        if (string.IsNullOrEmpty(singularText) == string.IsNullOrEmpty(pluralText))
             return false;
 
         var previousTextIndex = contentIndex - 1;
@@ -233,13 +219,18 @@ internal static class InterpolationConverter
         if (wordStart == trimmedLiteral.Length || icuParts.Count < 2)
             return false;
 
+        // This ternary belongs to the preceding quantity, even if folding cannot proceed.
+        // Do not subsequently emit a second standalone plural for the same quantity.
+        suppressStandalonePlural = true;
+        if (!emittedHoleNames.TryGetValue(previousQuantityIndex, out var uniqueName))
+            return false;
+
+        if (previousQuantityHole.FormatClause is not null)
+            warnings.Add($"Format specifier on quantity '{previousQuantityText}' is represented by the ICU plural number sign");
+
         icuParts.RemoveRange(icuParts.Count - 2, 2);
-        var uniqueName = usedNames.Contains(quantity.name)
-            ? quantity.name
-            : AddParameter(quantity, usedNames, argumentMap);
-        var singular = EscapeForIcu($"#{trimmedLiteral}");
-        var pluralSuffix = string.IsNullOrEmpty(pluralText) ? singularText : pluralText;
-        var plural = EscapeForIcu($"#{trimmedLiteral}{pluralSuffix}");
+        var singular = $"#{EscapeForIcuPluralBody(trimmedLiteral)}{EscapeForIcuPluralBody(singularText)}";
+        var plural = $"#{EscapeForIcuPluralBody(trimmedLiteral)}{EscapeForIcuPluralBody(pluralText)}";
         icuPlural = $"{{{uniqueName}, plural, one {{{singular}}} other {{{plural}}}}}";
         return true;
     }
@@ -255,17 +246,24 @@ internal static class InterpolationConverter
             || (string.IsNullOrEmpty(singularText) && string.IsNullOrEmpty(pluralText)))
             return false;
 
+        // A standalone full-word ternary is only demonstrably plural when the
+        // plural arm is the singular arm plus its English plural suffix. Other
+        // conditionals (for example Enabled/Disabled) remain selects.
+        if (!string.IsNullOrEmpty(singularText) && !string.IsNullOrEmpty(pluralText)
+            && !string.Equals(pluralText, singularText + "s", StringComparison.Ordinal))
+            return false;
+
         var uniqueName = AddParameter(quantity, usedNames, argumentMap);
         if (string.IsNullOrEmpty(singularText) || string.IsNullOrEmpty(pluralText))
         {
-            var singularSuffix = EscapeForIcu(singularText);
-            var pluralSuffix = EscapeForIcu(pluralText);
+            var singularSuffix = EscapeForIcuPluralBody(singularText);
+            var pluralSuffix = EscapeForIcuPluralBody(pluralText);
             icuPlural = $"{{{uniqueName}, plural, one {{{singularSuffix}}} other {{{pluralSuffix}}}}}";
             return true;
         }
 
-        var singular = EscapeForIcu($"# {singularText}");
-        var plural = EscapeForIcu($"# {pluralText}");
+        var singular = $"# {EscapeForIcuPluralBody(singularText)}";
+        var plural = $"# {EscapeForIcuPluralBody(pluralText)}";
         icuPlural = $"{{{uniqueName}, plural, one {{{singular}}} other {{{plural}}}}}";
         return true;
     }
@@ -326,7 +324,7 @@ internal static class InterpolationConverter
             return false;
 
         var (name, exprText, isComplex) = AnalyzeExpression(quantityExpression);
-        if (name is null || isComplex)
+        if (name is null || isComplex || !IsQuantityName(name))
             return false;
 
         quantity = (name, exprText);
@@ -343,16 +341,23 @@ internal static class InterpolationConverter
     private static string AddParameter(
         (string name, string exprText) parameter,
         HashSet<string> usedNames,
+        Dictionary<string, string> argumentMap) =>
+        AddParameter(parameter.name, parameter.exprText, usedNames, argumentMap);
+
+    private static string AddParameter(
+        string? parameterName,
+        string exprText,
+        HashSet<string> usedNames,
         Dictionary<string, string> argumentMap)
     {
-        var baseName = parameter.name;
+        var baseName = parameterName ?? $"arg{usedNames.Count}";
         var uniqueName = baseName;
         var suffix = 2;
         while (!usedNames.Add(uniqueName))
             uniqueName = $"{baseName}{suffix++}";
 
-        if (parameter.exprText != uniqueName)
-            argumentMap[uniqueName] = parameter.exprText;
+        if (exprText != uniqueName)
+            argumentMap[uniqueName] = exprText;
 
         return uniqueName;
     }
@@ -402,4 +407,7 @@ internal static class InterpolationConverter
         // and single quotes
         return text.Replace("'", "''").Replace("{", "'{'").Replace("}", "'}'");
     }
+
+    private static string EscapeForIcuPluralBody(string text) =>
+        EscapeForIcu(text).Replace("#", "'#'");
 }
