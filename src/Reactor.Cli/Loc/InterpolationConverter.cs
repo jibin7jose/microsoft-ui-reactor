@@ -33,11 +33,10 @@ internal static class InterpolationConverter
         ["f"] = "date, full",
     };
 
-    // Variable names that suggest quantities (for plural hint comments)
+    // Variable names that identify standalone plural candidates.
     private static readonly HashSet<string> QuantityHintNames = new(StringComparer.OrdinalIgnoreCase)
     {
         "count", "total", "length", "size", "amount", "quantity",
-        "remaining",
     };
 
     public static (string? icuMessage, Dictionary<string, string>? argumentMap, List<string> warnings)
@@ -133,7 +132,7 @@ internal static class InterpolationConverter
     }
 
     /// <summary>
-    /// Checks if a parameter name suggests a quantity (for plural hint comments).
+    /// Checks if a parameter name suggests a quantity.
     /// </summary>
     public static bool IsQuantityName(string name)
     {
@@ -192,7 +191,7 @@ internal static class InterpolationConverter
     {
         icuPlural = null;
         suppressStandalonePlural = false;
-        if (!TryGetPluralTernary(expr, out var quantity, out var singularText, out var pluralText))
+        if (!TryGetPluralTernary(expr, requireQuantityName: false, out var quantity, out var singularText, out var pluralText))
             return false;
 
         var previousTextIndex = contentIndex - 1;
@@ -210,6 +209,10 @@ internal static class InterpolationConverter
         if (!string.Equals(previousQuantityText, quantity.exprText, StringComparison.Ordinal))
             return false;
 
+        // This ternary belongs to the preceding quantity, even if folding cannot proceed.
+        // Do not subsequently emit a second standalone plural for the same quantity.
+        suppressStandalonePlural = true;
+
         var literal = previousText.TextToken.ValueText;
         var trimmedLiteral = literal.TrimEnd();
         var wordStart = trimmedLiteral.Length;
@@ -219,9 +222,6 @@ internal static class InterpolationConverter
         if (wordStart == trimmedLiteral.Length || icuParts.Count < 2)
             return false;
 
-        // This ternary belongs to the preceding quantity, even if folding cannot proceed.
-        // Do not subsequently emit a second standalone plural for the same quantity.
-        suppressStandalonePlural = true;
         if (!emittedHoleNames.TryGetValue(previousQuantityIndex, out var uniqueName))
             return false;
 
@@ -242,7 +242,7 @@ internal static class InterpolationConverter
         out string? icuPlural)
     {
         icuPlural = null;
-        if (!TryGetPluralTernary(expr, out var quantity, out var singularText, out var pluralText)
+        if (!TryGetPluralTernary(expr, requireQuantityName: true, out var quantity, out var singularText, out var pluralText)
             || (string.IsNullOrEmpty(singularText) && string.IsNullOrEmpty(pluralText)))
             return false;
 
@@ -270,6 +270,7 @@ internal static class InterpolationConverter
 
     private static bool TryGetPluralTernary(
         ExpressionSyntax expr,
+        bool requireQuantityName,
         out (string name, string exprText) quantity,
         out string singularText,
         out string pluralText)
@@ -279,7 +280,7 @@ internal static class InterpolationConverter
         pluralText = string.Empty;
 
         if (expr is not ConditionalExpressionSyntax ternary
-            || !TryGetPluralCondition(ternary.Condition, out quantity, out var trueIsSingular))
+            || !TryGetPluralCondition(ternary.Condition, requireQuantityName, out quantity, out var trueIsSingular))
             return false;
 
         if (ternary.WhenTrue is not LiteralExpressionSyntax trueLiteral
@@ -304,6 +305,7 @@ internal static class InterpolationConverter
 
     private static bool TryGetPluralCondition(
         ExpressionSyntax condition,
+        bool requireQuantityName,
         out (string name, string exprText) quantity,
         out bool trueIsSingular)
     {
@@ -324,7 +326,7 @@ internal static class InterpolationConverter
             return false;
 
         var (name, exprText, isComplex) = AnalyzeExpression(quantityExpression);
-        if (name is null || isComplex || !IsQuantityName(name))
+        if (name is null || isComplex || (requireQuantityName && !IsQuantityName(name)))
             return false;
 
         quantity = (name, exprText);
